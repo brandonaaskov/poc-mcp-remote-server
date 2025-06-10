@@ -43,6 +43,10 @@ const tools = [
       },
       required: ["message"],
     },
+    annotations: {
+      readOnly: true,
+      destructive: false,
+    },
   },
 ]
 
@@ -62,112 +66,175 @@ function handleToolCall(name: string, arguments_: any) {
   throw new Error(`Unknown tool: ${name}`)
 }
 
-// SSE handler
-async function handleSSE(req: Request): Promise<Response> {
-  const body = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder()
-      
-      // Send initial connection message
-      controller.enqueue(encoder.encode("data: " + JSON.stringify({
-        jsonrpc: "2.0",
-        method: "connection_established",
-      }) + "\n\n"))
-      
-      // Process incoming messages
-      req.body?.pipeThrough(new TextDecoderStream()).pipeTo(
-        new WritableStream({
-          write(chunk) {
-            try {
-              const lines = chunk.trim().split("\n")
-              
-              for (const line of lines) {
-                if (line.startsWith("data: ")) {
-                  const data = JSON.parse(line.slice(6))
-                  
-                  // Handle different message types
-                  let response: any
-                  
-                  switch (data.method) {
-                    case "initialize":
-                      response = {
-                        jsonrpc: "2.0",
-                        id: data.id,
-                        result: {
-                          protocolVersion: "2024-11-05",
-                          capabilities: {
-                            tools: {},
-                          },
-                          serverInfo,
-                        },
-                      }
-                      break
-                      
-                    case "tools/list":
-                      response = {
-                        jsonrpc: "2.0",
-                        id: data.id,
-                        result: { tools },
-                      }
-                      break
-                      
-                    case "tools/call":
-                      try {
-                        const result = handleToolCall(
-                          data.params.name,
-                          data.params.arguments
-                        )
-                        response = {
-                          jsonrpc: "2.0",
-                          id: data.id,
-                          result,
-                        }
-                      } catch (error) {
-                        response = {
-                          jsonrpc: "2.0",
-                          id: data.id,
-                          error: {
-                            code: -32603,
-                            message: getErrorMessage(error),
-                          },
-                        }
-                      }
-                      break
-                      
-                    default:
-                      response = {
-                        jsonrpc: "2.0",
-                        id: data.id,
-                        error: {
-                          code: -32601,
-                          message: `Method not found: ${data.method}`,
-                        },
-                      }
-                  }
-                  
-                  if (response) {
-                    controller.enqueue(
-                      encoder.encode("data: " + JSON.stringify(response) + "\n\n")
-                    )
-                  }
-                }
-              }
-            } catch (error) {
-              console.error("Error processing message:", error)
+// Handle JSON-RPC messages (supports batching)
+async function handleJsonRpc(messages: any | any[]): Promise<any | any[]> {
+  const isBatch = Array.isArray(messages)
+  const requests = isBatch ? messages : [messages]
+  const responses: any[] = []
+  
+  for (const message of requests) {
+    let response: any = null
+    
+    try {
+      switch (message.method) {
+        case "initialize":
+          response = {
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: {
+                tools: {},
+                completions: {},
+              },
+              serverInfo,
+            },
+          }
+          break
+          
+        case "tools/list":
+          response = {
+            jsonrpc: "2.0",
+            id: message.id,
+            result: { tools },
+          }
+          break
+          
+        case "tools/call":
+          try {
+            const result = handleToolCall(
+              message.params.name,
+              message.params.arguments
+            )
+            response = {
+              jsonrpc: "2.0",
+              id: message.id,
+              result,
             }
+          } catch (error) {
+            response = {
+              jsonrpc: "2.0",
+              id: message.id,
+              error: {
+                code: -32603,
+                message: getErrorMessage(error),
+              },
+            }
+          }
+          break
+          
+        case "completions/list":
+          response = {
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              completions: [],
+            },
+          }
+          break
+          
+        default:
+          if (message.id !== undefined) {
+            response = {
+              jsonrpc: "2.0",
+              id: message.id,
+              error: {
+                code: -32601,
+                message: `Method not found: ${message.method}`,
+              },
+            }
+          }
+      }
+      
+      if (response) {
+        responses.push(response)
+      }
+    } catch (error) {
+      if (message.id !== undefined) {
+        responses.push({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: {
+            code: -32603,
+            message: getErrorMessage(error),
           },
         })
-      )
-    },
-  })
+      }
+    }
+  }
   
-  return new Response(body, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-    },
-  })
+  return isBatch ? responses : responses[0]
+}
+
+// Streamable HTTP transport handler
+async function handleStreamableHttp(req: Request): Promise<Response> {
+  try {
+    const contentType = req.headers.get("content-type") || ""
+    
+    // Handle JSON-RPC requests
+    if (contentType.includes("application/json")) {
+      const body = await req.json()
+      const response = await handleJsonRpc(body)
+      
+      return new Response(JSON.stringify(response), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      })
+    }
+    
+    // Handle streaming requests (JSONL)
+    if (contentType.includes("application/jsonl") || contentType.includes("application/x-ndjson")) {
+      const encoder = new TextEncoder()
+      const decoder = new TextDecoder()
+      
+      const stream = new TransformStream({
+        async transform(chunk, controller) {
+          const lines = decoder.decode(chunk).split("\n").filter(line => line.trim())
+          
+          for (const line of lines) {
+            try {
+              const message = JSON.parse(line)
+              const response = await handleJsonRpc(message)
+              if (response) {
+                controller.enqueue(encoder.encode(JSON.stringify(response) + "\n"))
+              }
+            } catch (error) {
+              console.error("Error processing line:", error)
+            }
+          }
+        },
+      })
+      
+      return new Response(req.body!.pipeThrough(stream), {
+        headers: {
+          "Content-Type": "application/jsonl",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      })
+    }
+    
+    return new Response("Unsupported content type", { status: 400 })
+  } catch (error) {
+    return new Response(JSON.stringify({
+      jsonrpc: "2.0",
+      error: {
+        code: -32700,
+        message: "Parse error",
+      },
+    }), {
+      status: 400,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    })
+  }
 }
 
 // Generate random string for client IDs, codes, and tokens
@@ -301,9 +368,9 @@ Deno.serve({ port: PORT }, async (req) => {
     }), { headers })
   }
   
-  // SSE endpoint (protected)
-  if (url.pathname === "/sse" && req.method === "POST") {
-    // Check for authorization header
+  // MCP endpoint with streamable HTTP transport
+  if (url.pathname === "/mcp" || url.pathname === "/") {
+    // Check for authorization header if present
     const authHeader = req.headers.get("Authorization")
     if (authHeader && authHeader.startsWith("Bearer ")) {
       const token = authHeader.substring(7)
@@ -314,13 +381,33 @@ Deno.serve({ port: PORT }, async (req) => {
       }
     }
     
-    return handleSSE(req)
+    // Handle POST requests with streamable HTTP
+    if (req.method === "POST") {
+      return handleStreamableHttp(req)
+    }
+    
+    // Handle GET requests for basic info
+    if (req.method === "GET") {
+      return new Response(JSON.stringify({
+        name: serverInfo.name,
+        version: serverInfo.version,
+        protocolVersion: "2025-03-26",
+        transport: "streamable-http",
+      }), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      })
+    }
   }
   
-  return new Response("MCP Server - Use POST /sse for SSE transport", {
+  return new Response("MCP Server - Protocol version 2025-03-26", {
     status: 200,
   })
 })
 
-console.log(`MCP Server running on http://localhost:${PORT}`)
-console.log(`SSE endpoint: http://localhost:${PORT}/sse`)
+console.log(`MCP Server running on ${BASE_URL}`)
+console.log(`MCP endpoint: ${BASE_URL}/mcp`)
+console.log(`Protocol version: 2025-03-26`)
+console.log(`Transport: Streamable HTTP`)

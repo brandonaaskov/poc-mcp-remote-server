@@ -1,6 +1,8 @@
 {
   "tasks": {
-    "dev": "deno run --allow-net --allow-env --allow-read main.ts"
+    "start": "deno run --allow-net --allow-env --allow-read main.ts",
+    "dev": "deno run --allow-net --allow-env --allow-read --watch main.ts",
+    "inspector": "npx @modelcontextprotocol/inspector"
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@1"
